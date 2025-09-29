@@ -1,0 +1,210 @@
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import os
+from keras.models import Sequential
+from keras.layers import LSTM, Dense
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+import multiprocessing as mp
+
+def worker(subset, look_back):
+    X, Y = [], []
+    for i in range(len(subset) - look_back - 1):
+        a = subset[i:(i + look_back), 0]
+        X.append(a)
+        Y.append(subset[i + look_back, 0])
+    return np.array(X), np.array(Y)
+
+def create_dataset_parallel(dataset, look_back):
+    print("Veri seti paralel olarak oluşturuluyor...")
+    n_cpu = mp.cpu_count()
+    chunk_size = len(dataset) // n_cpu
+    chunks = [dataset[i:i + chunk_size] for i in range(0, len(dataset), chunk_size)]
+    
+    with mp.Pool(n_cpu) as pool:
+        results = pool.starmap(worker, [(chunk, look_back) for chunk in chunks])
+    
+    X, Y = [], []
+    for result in results:
+        if result[0].size > 0 and result[1].size > 0:
+            X.append(result[0])
+            Y.append(result[1])
+    
+    if not X or not Y:
+        raise ValueError("Tüm alt parçalar boş döndü!")
+
+    X = np.vstack(X)
+    Y = np.hstack(Y)
+    
+    return X, Y
+
+if __name__ == "__main__":
+    print("Veri yükleniyor...")
+# Veriyi yükleyelim
+data = pd.read_csv('spi_data.csv')
+
+# DateTime formatına çevirelim
+data['date'] = pd.to_datetime(data['date'])
+data.set_index('date', inplace=True)
+
+# SPI değerlerini alalım
+spi_values = data['spi'].values.reshape(-1, 1)
+
+# Veriyi ölçeklendirelim
+scaler = MinMaxScaler(feature_range=(0, 1))
+spi_scaled = scaler.fit_transform(spi_values)
+
+# Eğitim ve test verilerini hazırlayalım
+def create_dataset(dataset, look_back=1):
+    X, Y = [], []
+    for i in range(len(dataset) - look_back):
+        a = dataset[i:(i + look_back), 0]
+        X.append(a)
+        Y.append(dataset[i + look_back, 0])
+    return np.array(X), np.array(Y)
+
+look_back = 12  # 1 yıl
+X, y = create_dataset(spi_scaled, look_back)
+
+# LSTM girdi boyutu [samples, time steps, features] olacak şekilde şekillendirelim
+X = X.reshape((X.shape[0], X.shape[1], 1))
+
+# Eğitim ve test setlerine ayırma
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, shuffle=False)
+
+# LSTM modelini oluşturalım
+model = Sequential()
+model.add(LSTM(50, return_sequences=True, input_shape=(look_back, 1)))
+model.add(LSTM(50, return_sequences=False))
+model.add(Dense(1))
+
+model.compile(optimizer='adam', loss='mean_squared_error')
+
+
+# Modeli eğitelim
+model.fit(X_train, y_train, epochs=180, batch_size=1, verbose=2)
+
+# Tahmin yapalım
+train_predict = model.predict(X_train)
+test_predict = model.predict(X_test)
+
+# Tahminleri geri ölçeklendirelim
+train_predict = scaler.inverse_transform(train_predict)
+y_train = scaler.inverse_transform(y_train.reshape(-1, 1))
+test_predict = scaler.inverse_transform(test_predict)
+y_test = scaler.inverse_transform(y_test.reshape(-1, 1))
+
+# Tahmin sonuçlarını zaman ekseniyle birlikte ekleyelim
+train_predict_plot = np.empty_like(spi_values)
+train_predict_plot[:, :] = np.nan
+train_predict_plot[look_back:len(train_predict) + look_back, :] = train_predict
+
+test_predict_plot = np.empty_like(spi_values)
+test_predict_plot[:, :] = np.nan
+test_predict_plot[len(train_predict) + look_back:len(test_predict) + len(train_predict) + look_back, :] = test_predict
+
+# Tahmin sonuçlarını çizelim
+plt.figure(figsize=(15, 6))
+plt.plot(data.index, spi_values, label='Gerçek Değerler')
+plt.plot(data.index, train_predict_plot, label='Eğitim Tahminleri')
+plt.plot(data.index, test_predict_plot, label='Test Tahminleri')
+plt.legend()
+plt.savefig('tahmin_sonuclari_spi.png')
+plt.show()
+
+# Gelecek tahminleri için boş bir liste oluşturalım
+future_predictions = []
+last_data = spi_scaled[-look_back:].reshape(1, look_back, 1)
+
+for _ in range(50 * 12):  # 50 yıl, aylık tahminler
+    future_pred = model.predict(last_data)
+    future_predictions.append(future_pred[0][0])
+    last_data = np.append(last_data[:, 1:, :], future_pred.reshape(1, 1, 1), axis=1)
+
+# Gelecek tahminlerini geri ölçeklendirelim
+future_predictions = scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1))
+
+# Gelecek tahminlerini 3 ile -3 arasında sınırlayalım
+print("Önce Sınırlandırma: Min - Max", np.min(future_predictions), np.max(future_predictions))
+future_predictions = np.clip(future_predictions, -2.5, 2.5)
+print("Sonra Sınırlandırma: Min - Max", np.min(future_predictions), np.max(future_predictions))
+
+# Gelecek tahminlerini zaman serisi ile birleştirelim
+future_dates = pd.date_range(start=data.index[-1] + pd.DateOffset(months=1), periods=50*12, freq='M')
+future_spi = pd.DataFrame(data=future_predictions, index=future_dates, columns=['spi'])
+
+# 2023 yılından itibaren sonuçları göstermek için yeni bir DataFrame oluşturun
+start_date = '2023-12-01'
+result_index = data.index.append(future_spi.index)
+results = pd.DataFrame(index=result_index)
+
+# Gerçek değerleri ekleyelim
+results['Gerçek Değerler'] = np.nan
+results['Gerçek Değerler'].loc[data.index] = data['spi']
+
+# Eğitim ve test tahminlerini ekleyelim
+results['Eğitim Tahminleri'] = np.nan
+results['Test Tahminleri'] = np.nan
+
+train_predict_index = data.index[look_back:len(train_predict) + look_back]
+test_predict_index = data.index[len(train_predict) + look_back:len(train_predict) + look_back + len(test_predict)]
+
+results.loc[train_predict_index, 'Eğitim Tahminleri'] = train_predict.flatten()
+results.loc[test_predict_index, 'Test Tahminleri'] = test_predict.flatten()
+
+# Gelecek tahminlerini ekleyelim
+results['Gelecek Tahminleri'] = np.nan
+results.loc[future_spi.index, 'Gelecek Tahminleri'] = future_predictions.flatten()
+
+# Sonuçları bir Excel dosyasına yazdıralım
+results.to_excel('spi_tahmin_sonuclari_lstm.xlsx')
+
+# Gelecek tahminlerini ayrı bir grafik olarak çizelim
+plt.figure(figsize=(15, 6))
+plt.plot(future_spi.index, future_spi['spi'], label='Gelecek Tahminleri', color='red')
+plt.title('Gelecek Tahminleri (LSTM)')
+plt.xlabel('Tarih')
+plt.ylabel('SPI Değeri')
+plt.legend()
+plt.savefig('gelecek_tahminleri_spi.png')
+plt.show()
+
+# Performans ölçütlerini hesaplayalım
+train_rmse = np.sqrt(mean_squared_error(y_train, train_predict))
+train_mae = mean_absolute_error(y_train, train_predict)
+train_r2 = r2_score(y_train, train_predict)
+
+print(f"Training RMSE (LSTM): {train_rmse}")
+print(f"Training MAE (LSTM): {train_mae}")
+print(f"Training R2 (LSTM): {train_r2}")
+
+# Grafikleri kaydedeceğimiz klasörü oluşturalım
+os.makedirs('plots_spi', exist_ok=True)
+
+# Grafikleri klasöre kaydedelim
+plt.figure(figsize=(15, 6))
+plt.plot(data.index, spi_values, label='Gerçek Değerler')
+plt.plot(data.index, train_predict_plot, label='Eğitim Tahminleri')
+plt.plot(data.index, test_predict_plot, label='Test Tahminleri')
+plt.legend()
+plt.savefig('plots_spi/tahmin_sonuclari_spi.png')
+plt.show()
+
+plt.figure(figsize=(15, 6))
+plt.plot(results.index, results['Gelecek Tahminleri'], label='Gelecek Tahminleri')
+plt.legend()
+plt.savefig('plots_spi/gelecek_tahminleri_spi.png')
+plt.show()
+
+plt.figure(figsize=(15, 6))
+plt.plot(results.index, results['Gerçek Değerler'], label='Gerçek Değerler')
+plt.plot(results.index, results['Eğitim Tahminleri'], label='Eğitim Tahminleri')
+plt.plot(results.index, results['Test Tahminleri'], label='Test Tahminleri')
+plt.plot(results.index, results['Gelecek Tahminleri'], label='Gelecek Tahminleri')
+plt.legend()
+plt.savefig('plots_spi/SPI_1.png')
+plt.show()
