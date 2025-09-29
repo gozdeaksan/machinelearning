@@ -3,7 +3,7 @@
 This repository contains **machine learning-based drought prediction studies** using **SPI, SPEI, and RDI drought indices** derived from meteorological stations across **Spain, Italy, Turkey, and Greece**. 
 
 ## 🚀 Contents
-- 📊 Data: SPI, SPEI, RDI (1973–2023)
+- 📊 Data: SPI (1973–2023)
 - 🤖 Machine Learning Models:
   - Random Forest (RF)
   - Gradient Boosting Machine (GBM)
